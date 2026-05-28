@@ -1,0 +1,187 @@
+"""
+Machine Learning Model — Random Forest Classifier
+===================================================
+Trains a Random Forest model to classify honeypot sessions as:
+  Normal | Suspicious | Malicious
+
+Run: python src/train_model.py
+
+After training, the model + label encoder are saved in models/
+so the dashboard and prediction script can load them.
+"""
+
+import os
+import json
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble          import RandomForestClassifier
+from sklearn.model_selection   import train_test_split, cross_val_score
+from sklearn.preprocessing     import LabelEncoder
+from sklearn.metrics           import (
+    classification_report, confusion_matrix, accuracy_score
+)
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+BASE_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CSV_FILE    = os.path.join(BASE_DIR, "data", "processed_logs.csv")
+MODEL_DIR   = os.path.join(BASE_DIR, "models")
+MODEL_FILE  = os.path.join(MODEL_DIR, "rf_model.pkl")
+ENCODER_FILE= os.path.join(MODEL_DIR, "label_encoder.pkl")
+METRICS_FILE= os.path.join(MODEL_DIR, "metrics.json")
+
+# Features used for training
+FEATURE_COLS = ["login_attempts", "command_count", "session_duration", "has_malicious_cmd"]
+LABEL_COL    = "label"
+
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+
+# ── Generate synthetic training data if CSV is too small ──────────────────────
+def generate_synthetic_data(n_samples: int = 500) -> pd.DataFrame:
+    """
+    Generate realistic synthetic honeypot data for training.
+    Used when real log data is insufficient (< 30 records).
+    """
+    np.random.seed(42)
+    records = []
+
+    # Normal — quick scanners, 1 attempt, no commands
+    for _ in range(n_samples // 3):
+        records.append({
+            "login_attempts"  : np.random.randint(1, 2),
+            "command_count"   : 0,
+            "session_duration": np.random.uniform(0, 3),
+            "has_malicious_cmd": 0,
+            "label"           : "Normal",
+        })
+
+    # Suspicious — a few attempts or basic recon
+    for _ in range(n_samples // 3):
+        records.append({
+            "login_attempts"  : np.random.randint(2, 5),
+            "command_count"   : np.random.randint(1, 4),
+            "session_duration": np.random.uniform(5, 40),
+            "has_malicious_cmd": 0,
+            "label"           : "Suspicious",
+        })
+
+    # Malicious — many attempts, malicious commands, long sessions
+    for _ in range(n_samples // 3):
+        records.append({
+            "login_attempts"  : np.random.randint(4, 15),
+            "command_count"   : np.random.randint(3, 20),
+            "session_duration": np.random.uniform(30, 180),
+            "has_malicious_cmd": np.random.choice([0, 1], p=[0.2, 0.8]),
+            "label"           : "Malicious",
+        })
+
+    return pd.DataFrame(records)
+
+
+# ── Main Training Pipeline ────────────────────────────────────────────────────
+def train():
+    print(f"\n{'='*55}")
+    print("  RANDOM FOREST TRAINING PIPELINE")
+    print(f"{'='*55}\n")
+
+    # ── Load data ──────────────────────────────────────────────────────────────
+    if os.path.exists(CSV_FILE):
+        df = pd.read_csv(CSV_FILE)
+        print(f"[*] Loaded {len(df)} records from {CSV_FILE}")
+    else:
+        df = pd.DataFrame()
+        print("[!] No processed CSV found — using synthetic data only.")
+
+    # Augment with synthetic data if insufficient real data
+    MIN_REAL = 30
+    if len(df) < MIN_REAL:
+        print(f"[*] Insufficient real data ({len(df)} < {MIN_REAL}). Augmenting with synthetic samples...")
+        synthetic = generate_synthetic_data(500)
+        df = pd.concat([df[FEATURE_COLS + [LABEL_COL]].dropna(), synthetic], ignore_index=True)
+        print(f"[*] Combined dataset size: {len(df)}")
+    else:
+        df = df[FEATURE_COLS + [LABEL_COL]].dropna()
+
+    # ── Label distribution ─────────────────────────────────────────────────────
+    print("\n[*] Label distribution:")
+    for label, count in df[LABEL_COL].value_counts().items():
+        bar = "█" * (count // 5)
+        print(f"    {label:12s}: {count:4d}  {bar}")
+
+    # ── Encode labels ──────────────────────────────────────────────────────────
+    le = LabelEncoder()
+    y  = le.fit_transform(df[LABEL_COL])
+    X  = df[FEATURE_COLS].values
+
+    print(f"\n[*] Classes: {list(le.classes_)}")
+
+    # ── Train / Test split ─────────────────────────────────────────────────────
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    print(f"[*] Train: {len(X_train)}  |  Test: {len(X_test)}")
+
+    # ── Train Random Forest ────────────────────────────────────────────────────
+    print("\n[*] Training Random Forest (100 trees)...")
+    model = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=None,
+        random_state=42,
+        class_weight="balanced",
+        n_jobs=-1,
+    )
+    model.fit(X_train, y_train)
+
+    # ── Evaluate ───────────────────────────────────────────────────────────────
+    y_pred    = model.predict(X_test)
+    accuracy  = accuracy_score(y_test, y_pred)
+    cv_scores = cross_val_score(model, X, y, cv=5, scoring="accuracy")
+
+    print(f"\n{'─'*55}")
+    print("  EVALUATION RESULTS")
+    print(f"{'─'*55}")
+    print(f"  Test Accuracy    : {accuracy:.4f} ({accuracy*100:.1f}%)")
+    print(f"  CV Accuracy (5-fold): {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+    print(f"\n  Classification Report:\n")
+    print(classification_report(y_test, y_pred, target_names=le.classes_))
+
+    print("  Confusion Matrix:")
+    cm = confusion_matrix(y_test, y_pred)
+    for row in cm:
+        print("    " + "  ".join(f"{v:4d}" for v in row))
+
+    # Feature importance
+    print("\n  Feature Importances:")
+    for feat, imp in sorted(zip(FEATURE_COLS, model.feature_importances_), key=lambda x: -x[1]):
+        bar = "█" * int(imp * 40)
+        print(f"    {feat:22s}: {imp:.4f}  {bar}")
+
+    # ── Save model + encoder ───────────────────────────────────────────────────
+    joblib.dump(model, MODEL_FILE)
+    joblib.dump(le, ENCODER_FILE)
+
+    # Save metrics JSON for dashboard
+    metrics = {
+        "accuracy"      : round(accuracy, 4),
+        "cv_mean"       : round(cv_scores.mean(), 4),
+        "cv_std"        : round(cv_scores.std(), 4),
+        "classes"       : list(le.classes_),
+        "feature_cols"  : FEATURE_COLS,
+        "n_train"       : len(X_train),
+        "n_test"        : len(X_test),
+        "feature_importance": dict(zip(FEATURE_COLS, [round(v, 4) for v in model.feature_importances_])),
+    }
+    with open(METRICS_FILE, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    print(f"\n[✓] Model saved    : {MODEL_FILE}")
+    print(f"[✓] Encoder saved  : {ENCODER_FILE}")
+    print(f"[✓] Metrics saved  : {METRICS_FILE}")
+    print(f"\n[→] Next: streamlit run dashboard/app.py\n")
+
+    return model, le
+
+
+if __name__ == "__main__":
+    train()
